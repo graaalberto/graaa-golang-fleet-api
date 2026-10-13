@@ -3,6 +3,8 @@ package websocket
 import (
 	"log"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 
 	"github.com/gin-gonic/gin"
@@ -13,7 +15,20 @@ var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
 	CheckOrigin: func(r *http.Request) bool {
-		return true
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			return true
+		}
+		allowedOrigins := strings.Split(os.Getenv("ALLOWED_ORIGINS"), ",")
+		if len(allowedOrigins) == 1 && strings.TrimSpace(allowedOrigins[0]) == "" {
+			allowedOrigins = []string{"http://localhost:5173"}
+		}
+		for _, allowed := range allowedOrigins {
+			if strings.TrimSpace(allowed) != "" && origin == strings.TrimSpace(allowed) {
+				return true
+			}
+		}
+		return false
 	},
 }
 

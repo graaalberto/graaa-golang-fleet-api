@@ -1,3 +1,15 @@
+# FrotaGo Fleet API
+
+## Configuração de segurança
+
+- Defina `JWT_SECRET` com a mesma chave aleatória de pelo menos 32 bytes usada pelo auth API. Só são aceites JWT HS256 de acesso (`token_type=access`) com expiração.
+- Defina `FLEET_TELEMETRY_TOKEN` com um segredo aleatório de pelo menos 32 bytes; use exatamente o mesmo valor na telemetry API. Apenas esta credencial pode atualizar a localização interna da viatura.
+- Defina `FLEET_PAYMENT_TOKEN` com outro segredo aleatório de pelo menos 32 bytes; use-o apenas entre payments e fleet API para sincronizar o estado do pagamento.
+- Defina `ALLOWED_ORIGINS` com a lista separada por vírgulas das origens exatas do frontend, incluindo esquema e porta, por exemplo `https://app.example.com`. O WebSocket também exige um JWT no subprotocolo `bearer`.
+- As operações de escrita REST requerem papel `admin` ou `member`; as leituras requerem um utilizador autenticado. A conclusão da corrida não altera automaticamente o estado do pagamento.
+
+## Estrutura
+
 backend-fleet-golang/
 ├── go.mod
 ├── .env.example

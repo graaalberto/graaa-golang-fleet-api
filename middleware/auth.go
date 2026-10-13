@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"crypto/subtle"
 	"fmt"
 	"net/http"
 	"os"
@@ -10,61 +11,147 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
+const minimumJWTSecretLength = 32
+
+type accessClaims struct {
+	UserID    string   `json:"user_id"`
+	TokenType string   `json:"token_type"`
+	Roles     []string `json:"roles"`
+	jwt.RegisteredClaims
+}
+
 func JWTAuthMiddleware() gin.HandlerFunc {
+	return jwtMiddleware(false)
+}
+
+func JWTWebSocketAuthMiddleware() gin.HandlerFunc {
+	return jwtMiddleware(true)
+}
+
+func jwtMiddleware(websocket bool) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		authHeader := c.GetHeader("Authorization")
-		if authHeader == "" {
-			c.JSON(http.StatusUnauthorized, gin.H{
-				"status":  "error",
-				"message": "Token de autenticação não fornecido no cabeçalho Authorization",
-			})
-			c.Abort()
-			return
-		}
-
-		tokenString := strings.TrimPrefix(authHeader, "Bearer ")
-		if tokenString == authHeader {
-			c.JSON(http.StatusUnauthorized, gin.H{
-				"status":  "error",
-				"message": "Formato inválido. Use: Bearer <token>",
-			})
-			c.Abort()
-			return
-		}
-
 		secret := os.Getenv("JWT_SECRET")
-		if secret == "" {
-			secret = "sua_chave_secreta_jwt_compartilhada_2026"
+		if len(secret) < minimumJWTSecretLength {
+			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
+				"status":  "error",
+				"message": "Autenticação não configurada",
+			})
+			return
 		}
 
-		token, err := jwt.Parse(tokenString, func(t *jwt.Token) (interface{}, error) {
-			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, fmt.Errorf("método de assinatura inesperado: %v", t.Header["alg"])
-			}
-			return []byte(secret), nil
-		})
+		tokenString := bearerToken(c.GetHeader("Authorization"))
+		if websocket && tokenString == "" {
+			tokenString = websocketToken(c.GetHeader("Sec-WebSocket-Protocol"))
+		}
+		if tokenString == "" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+				"status":  "error",
+				"message": "Token de autenticação não fornecido",
+			})
+			return
+		}
 
-		if err != nil || !token.Valid {
-			c.JSON(http.StatusUnauthorized, gin.H{
+		claims := &accessClaims{}
+		token, err := jwt.ParseWithClaims(
+			tokenString,
+			claims,
+			func(token *jwt.Token) (interface{}, error) {
+				if token.Method != jwt.SigningMethodHS256 {
+					return nil, fmt.Errorf("método de assinatura inválido")
+				}
+				return []byte(secret), nil
+			},
+			jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
+			jwt.WithExpirationRequired(),
+		)
+		if err != nil || token == nil || !token.Valid || claims.UserID == "" || claims.TokenType != "access" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
 				"status":  "error",
 				"message": "Token JWT inválido ou expirado",
 			})
-			c.Abort()
 			return
 		}
 
-		if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
-			if userID, exists := claims["user_id"]; exists {
-				c.Set("userID", userID)
-			} else if id, exists := claims["id"]; exists {
-				c.Set("userID", id)
+		c.Set("userID", claims.UserID)
+		c.Set("userRole", primaryRole(claims.Roles))
+		c.Next()
+	}
+}
+
+func bearerToken(header string) string {
+	parts := strings.Fields(header)
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
+		return ""
+	}
+	return parts[1]
+}
+
+func websocketToken(protocolHeader string) string {
+	protocols := strings.Split(protocolHeader, ",")
+	for i, protocol := range protocols {
+		if strings.TrimSpace(protocol) == "bearer" && i+1 < len(protocols) {
+			return strings.TrimSpace(protocols[i+1])
+		}
+	}
+	return ""
+}
+
+func primaryRole(roles []string) string {
+	role := "viewer"
+	for _, roleName := range roles {
+		switch strings.ToLower(roleName) {
+		case "admin":
+			return "admin"
+		case "member":
+			role = "member"
+		}
+	}
+	return role
+}
+
+func RequireRole(allowedRoles ...string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		role, _ := c.Get("userRole")
+		userRole, ok := role.(string)
+		if !ok {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"status": "error", "message": "Acesso negado"})
+			return
+		}
+
+		for _, allowed := range allowedRoles {
+			if strings.EqualFold(userRole, allowed) {
+				c.Next()
+				return
 			}
-			if role, exists := claims["role"]; exists {
-				c.Set("userRole", role)
-			}
-			if email, exists := claims["email"]; exists {
-				c.Set("userEmail", email)
-			}
+		}
+
+		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"status": "error", "message": "Acesso negado"})
+	}
+}
+
+func TelemetryServiceAuthMiddleware() gin.HandlerFunc {
+	return serviceTokenAuthMiddleware("FLEET_TELEMETRY_TOKEN", "Autenticação do serviço de telemetria não configurada")
+}
+
+func PaymentServiceAuthMiddleware() gin.HandlerFunc {
+	return serviceTokenAuthMiddleware("FLEET_PAYMENT_TOKEN", "Autenticação do serviço de pagamentos não configurada")
+}
+
+func serviceTokenAuthMiddleware(environmentKey, missingMessage string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		expected := os.Getenv(environmentKey)
+		if len(expected) < minimumJWTSecretLength {
+			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
+				"status":  "error",
+				"message": missingMessage,
+			})
+			return
+		}
+
+		provided := c.GetHeader("X-Service-Token")
+		if len(provided) != len(expected) || subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) != 1 {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"status": "error", "message": "Credencial de serviço inválida"})
+			return
 		}
 
 		c.Next()

@@ -59,6 +59,11 @@ func UpdateDriverStatus(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"status": "error", "message": "Motorista não encontrado"})
 		return
 	}
+	if c.GetString("userRole") != "admin" &&
+		(driver.UserID == nil || *driver.UserID != c.GetString("userID")) {
+		c.JSON(http.StatusForbidden, gin.H{"status": "error", "message": "Acesso negado"})
+		return
+	}
 
 	driver.Status = req.Status
 	config.DB.Save(&driver)

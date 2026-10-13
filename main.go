@@ -4,10 +4,12 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"frotago-fleet-api/config"
 	"frotago-fleet-api/handlers"
+	"frotago-fleet-api/middleware"
 	"frotago-fleet-api/websocket"
 
 	"github.com/gin-contrib/cors"
@@ -30,9 +32,18 @@ func main() {
 	}
 	r := gin.Default()
 
-	// CORS liberado para o Frontend React
+	allowedOrigins := strings.FieldsFunc(os.Getenv("ALLOWED_ORIGINS"), func(r rune) bool {
+		return r == ',' || r == ';'
+	})
+	for i := range allowedOrigins {
+		allowedOrigins[i] = strings.TrimSpace(allowedOrigins[i])
+	}
+	if len(allowedOrigins) == 0 {
+		allowedOrigins = []string{"http://localhost:5173"}
+	}
+
 	r.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"*"},
+		AllowOrigins:     allowedOrigins,
 		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization", "Accept", "X-Requested-With"},
 		ExposeHeaders:    []string{"Content-Length"},
@@ -51,33 +62,50 @@ func main() {
 	})
 
 	// Servidor de WebSocket para o mapa ao vivo
-	r.GET("/ws/fleet", websocket.HandleWebSocket)
+	r.GET("/ws/fleet", middleware.JWTWebSocketAuthMiddleware(), websocket.HandleWebSocket)
 
 	api := r.Group("/api")
+	api.Use(middleware.JWTAuthMiddleware())
 	{
 		// Viaturas
 		api.GET("/vehicles", handlers.GetVehicles)
-		api.POST("/vehicles", handlers.CreateVehicle)
-		api.POST("/vehicles/:id/telemetry", handlers.UpdateVehicleLocation)
 
 		// Motoristas
 		api.GET("/drivers", handlers.GetDrivers)
-		api.POST("/drivers", handlers.CreateDriver)
-		api.PATCH("/drivers/:id/status", handlers.UpdateDriverStatus)
 
 		// Corridas e Despacho
 		api.GET("/trips", handlers.GetTrips)
-		api.POST("/trips", handlers.CreateTrip)
-		api.PATCH("/trips/:id/status", handlers.UpdateTripStatus)
 
 		// Paragens Técnicas (com fotos MinIO)
 		api.GET("/stops", handlers.GetStops)
-		api.POST("/stops", handlers.CreateStop)
-		api.PATCH("/stops/:id/review", handlers.ReviewStop)
 
 		// Avarias Mecânicas (com fotos MinIO)
 		api.GET("/breakdowns", handlers.GetBreakdowns)
-		api.POST("/breakdowns", handlers.CreateBreakdown)
+	}
+
+	writes := r.Group("/api")
+	writes.Use(middleware.JWTAuthMiddleware(), middleware.RequireRole("admin", "member"))
+	{
+		writes.POST("/vehicles", handlers.CreateVehicle)
+		writes.POST("/drivers", handlers.CreateDriver)
+		writes.PATCH("/drivers/:id/status", handlers.UpdateDriverStatus)
+		writes.POST("/trips", handlers.CreateTrip)
+		writes.PATCH("/trips/:id/status", handlers.UpdateTripStatus)
+		writes.POST("/stops", handlers.CreateStop)
+		writes.PATCH("/stops/:id/review", handlers.ReviewStop)
+		writes.POST("/breakdowns", handlers.CreateBreakdown)
+	}
+
+	serviceAPI := r.Group("/api/vehicles")
+	serviceAPI.Use(middleware.TelemetryServiceAuthMiddleware())
+	{
+		serviceAPI.POST("/:id/telemetry", handlers.UpdateVehicleLocation)
+	}
+
+	paymentAPI := r.Group("/api/internal/trips")
+	paymentAPI.Use(middleware.PaymentServiceAuthMiddleware())
+	{
+		paymentAPI.PATCH("/:id/payment-status", handlers.UpdateTripPaymentStatus)
 	}
 
 	port := os.Getenv("PORT")
